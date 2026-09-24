@@ -33,7 +33,8 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip openssh-server openssh-client && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /run/sshd && printf 'export PATH=/usr/local/bin:$PATH\n' > /etc/profile.d/openab.sh
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
 ARG KIRO_CLI_VERSION=2.13.0
@@ -65,16 +66,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
+COPY scripts/docker-entrypoint.sh /usr/local/bin/openab-entrypoint
+RUN chmod +x /usr/local/bin/openab-entrypoint
 ENV HOME=/home/agent
 WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 
 USER agent
+EXPOSE 2222
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
 ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
 
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "--", "/usr/local/bin/openab-entrypoint"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

@@ -10,6 +10,51 @@ The default `Dockerfile` bundles both `openab` and `kiro-cli`:
 docker build -t openab:latest .
 ```
 
+## SSH Access
+
+The kiro image runs an **always-on SSH server** (port `2222`) alongside `openab`, plus the OpenSSH client (`ssh`, `scp`, `sftp`) for outbound connections. SSH sessions log in as the `agent` user.
+
+### Connect (plain Docker)
+
+```bash
+docker run -p 2222:2222 \
+  -e OPENAB_SSH_AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" \
+  openab:latest
+
+ssh -p 2222 agent@localhost
+```
+
+### Connect (Kubernetes)
+
+No Service or ingress needed — `kubectl port-forward` reaches the pod port directly:
+
+```bash
+kubectl port-forward deployment/openab-kiro 2222:2222 &
+ssh -p 2222 agent@localhost
+```
+
+Provide authorized keys via env (e.g. `agents.kiro.env.OPENAB_SSH_AUTHORIZED_KEYS` or `secretEnv`), or `kubectl exec` in once and append your key to `~/.ssh/authorized_keys` — the PVC persists it across restarts.
+
+### Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `OPENAB_SSH_PORT` | `2222` | sshd listen port |
+| `OPENAB_SSH_AUTHORIZED_KEYS` | — | Newline-separated public keys, merged into `~/.ssh/authorized_keys` |
+| `OPENAB_SSH_AUTHORIZED_KEYS_FILE` | — | Path to a file of public keys (e.g. a mounted Secret) |
+| `OPENAB_SSH_PASSWORD` | — | Password for `agent`. **Requires the container to run as root** (`--user root`) — a non-root sshd cannot read `/etc/shadow`. |
+| `OPENAB_SSH_PASSWORD_FILE` | — | File containing the password (same root requirement) |
+| `OPENAB_SSH_DISABLE` | — | Set `true` to skip sshd entirely |
+
+Host keys and `authorized_keys` live in `~/.ssh/` (persisted on the PVC); they fall back to `/tmp/ssh/` when `$HOME` is not writable. sshd startup failures are logged (`[openab] WARN`) but never prevent `openab` from starting.
+
+### Notes
+
+- **Key auth works everywhere; password auth needs root.** Non-root OpenSSH cannot validate passwords — this is an upstream limitation, not a config gap. If you need password auth, run the container as `--user root` (ssh sessions still land as `agent`).
+- **Only `agent` can log in** (`AllowUsers agent`, `PermitRootLogin no`).
+- SSH sessions share the `agent` uid with the `openab` process — they can read its files and `/proc/1/environ`. Treat SSH access as equivalent to `kubectl exec`.
+- The pod's `readOnlyRootFilesystem` is respected: everything sshd needs is generated at runtime under `~/.ssh` or `/tmp`.
+
 ## Helm Install
 
 ```bash

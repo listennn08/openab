@@ -113,17 +113,27 @@ RUN ARCH=$(dpkg --print-architecture) && \
     cp /tmp/kirocli/bin/* /usr/local/bin/ && \
     chmod +x /usr/local/bin/kiro-cli* && \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
-RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
+# SSH server + client — always-on remote shell access on port 2222.
+# sshd runs as the agent user; see scripts/docker-entrypoint.sh for env vars.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openssh-server openssh-client \
+    && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /run/sshd && \
+    printf 'export PATH=/usr/local/bin:$PATH\n' > /etc/profile.d/openab.sh
+COPY scripts/docker-entrypoint.sh /usr/local/bin/openab-entrypoint
+RUN chmod +x /usr/local/bin/openab-entrypoint && \
+    mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
 ENV HOME=/home/agent
 WORKDIR /home/agent
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 USER agent
+EXPOSE 2222
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
 ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "--", "/usr/local/bin/openab-entrypoint"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
 # =============================================================================
