@@ -66,6 +66,40 @@ Bot B output:
 
 This creates clear visual conversation threads within a Discord thread — essential for multi-agent collaboration.
 
+### `attach`
+
+Attach a local file to the reply — uploaded to the platform as a real file attachment.
+
+```
+[[attach:report.pdf]]
+[[attach:charts/usage.png]]
+Here is the report you asked for.
+```
+
+**Value**: A path to a file on disk. Relative paths resolve against the session's working directory; `~` expands to the bot home; absolute paths are accepted as long as they stay in scope.
+
+**Scope**: Files must live inside the session workspace or the bot home. Paths are canonicalized before checking, so `../` escapes and symlinks pointing outside are rejected — a rejected directive produces a `⚠️ Couldn't attach …` note in the thread.
+
+**Limits**: ≤25 MiB per file, ≤10 attachments per turn.
+
+**Behavior**:
+- Discord: uploaded as a message attachment (serenity `CreateAttachment`)
+- Slack: uploaded via `files.uploadV2` (`files.getUploadURLExternal` → `completeUploadExternal`) into the channel/thread — requires the **`files:write`** OAuth scope
+- Other platforms: falls back to a `⚠️ Couldn't attach …` text notice
+
+### Markdown images
+
+Local-path markdown images are attached implicitly — no directive needed:
+
+```
+Here's the chart:
+![usage chart](charts/usage.png)
+```
+
+If `charts/usage.png` resolves inside the workspace, the markup is stripped and the file is uploaded. Remote URLs (`https://…`, `data:…`), missing files, and out-of-scope paths are left as-is (out-of-scope and oversized files also produce a warning note).
+
+> Tip for agents: write the file to the workspace first, then reference it — either mechanism works, `[[attach:]]` is the explicit/documented form.
+
 ## Comparison with Other Platforms
 
 | Platform | Reply Mechanism | Agent Control |

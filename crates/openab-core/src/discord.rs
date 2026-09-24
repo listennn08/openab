@@ -1,6 +1,8 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutgoingAttachment, SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
@@ -130,6 +132,28 @@ impl ChatAdapter for DiscordAdapter {
                 self.send_message(channel, content).await
             }
         }
+    }
+
+    /// Upload a file to the channel/thread. Discord caps attachments at the
+    /// server's upload limit (25 MiB typical); the router already bounds
+    /// `file.data` at `outbound::MAX_ATTACHMENT_BYTES`.
+    async fn send_file(
+        &self,
+        channel: &ChannelRef,
+        file: &OutgoingAttachment,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let attachment = CreateAttachment::bytes(file.data.clone(), file.filename.clone());
+        let msg = ChannelId::new(ch_id)
+            .send_message(
+                &self.http,
+                serenity::builder::CreateMessage::new().add_file(attachment),
+            )
+            .await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
     }
 
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {

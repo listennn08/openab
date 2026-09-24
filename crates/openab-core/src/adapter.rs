@@ -19,6 +19,10 @@ use crate::reactions::StatusReactionController;
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// File paths the agent wants attached to the reply ([[attach:path]]).
+    /// Resolved and scope-checked against the session workspace by
+    /// `crate::outbound::extract_attachments` before delivery.
+    pub attachments: Vec<String>,
 }
 
 /// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
@@ -74,6 +78,17 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             // Validate: non-empty, reasonable length, no whitespace/control chars
                             if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
                                 directives.reply_to = Some(v.to_string());
+                            }
+                        }
+                        "attach" => {
+                            let v = value.trim();
+                            // Paths legitimately contain spaces, slashes, dots —
+                            // only reject control chars and pathological lengths.
+                            if !v.is_empty()
+                                && v.len() <= 512
+                                && !v.chars().any(|c| c.is_control())
+                            {
+                                directives.attachments.push(v.to_string());
                             }
                         }
                         _ => {
@@ -278,6 +293,20 @@ pub struct MessageRef {
     pub message_id: String,
 }
 
+/// A resolved local file the agent wants uploaded to a channel
+/// (agent → platform direction). Built by `crate::outbound` after
+/// workspace-scope validation; `data` is bounded by
+/// `crate::outbound::MAX_ATTACHMENT_BYTES`.
+#[derive(Debug)]
+pub struct OutgoingAttachment {
+    /// Display filename (sanitized basename).
+    pub filename: String,
+    /// File contents.
+    pub data: Vec<u8>,
+    /// Best-effort MIME hint for upload APIs that accept one.
+    pub mime: String,
+}
+
 /// Bundles per-message parameters for `AdapterRouter::handle_message`.
 ///
 /// Introduced to reduce parameter count and make the signature extensible
@@ -362,6 +391,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Default: unsupported (send-once only).
     async fn edit_message(&self, _msg: &MessageRef, _content: &str) -> Result<()> {
         Err(anyhow::anyhow!("edit_message not supported"))
+    }
+
+    /// Upload a file attachment to a channel.
+    /// Default: unsupported — the router falls back to a text notice.
+    async fn send_file(
+        &self,
+        _channel: &ChannelRef,
+        _file: &OutgoingAttachment,
+    ) -> Result<MessageRef> {
+        Err(anyhow::anyhow!("send_file not supported"))
     }
 
     /// Send a message as a reply to a specific message (Discord: message_reference).
@@ -752,6 +791,11 @@ impl AdapterRouter {
         let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        // Workspace boundary for outbound attachments ([[attach:…]] directives
+        // and ![…](path) markdown images): the session's effective workdir +
+        // bot home. Resolved before the closure per the clone-locals pattern.
+        let session_workdir = std::path::PathBuf::from(self.pool.session_workdir(thread_key).await);
+        let bot_home = self.bot_home.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -1131,6 +1175,20 @@ impl AdapterRouter {
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
+                    // Resolve outbound attachments before building the display
+                    // text: [[attach:…]] directive paths (failures surfaced as
+                    // notes) and ![…](path) markdown images (stripped only when
+                    // the file will actually be uploaded). Paths are
+                    // canonicalized and must stay inside the session workdir
+                    // or the bot home — everything else is rejected.
+                    let extracted = crate::outbound::extract_attachments(
+                        &text_buf,
+                        &directives.attachments,
+                        &session_workdir,
+                        &bot_home,
+                    );
+                    let text_buf = extracted.text;
+
                     // Build final content
                     let final_content =
                         display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
@@ -1362,6 +1420,55 @@ impl AdapterRouter {
                                 delivery_failed = true;
                             }
                             first = false;
+                        }
+                    }
+
+                    // Deliver outbound attachments after the text reply. Upload
+                    // failures fall back to a text notice so the user is never
+                    // left guessing; the turn only fails delivery if even the
+                    // notice can't be sent.
+                    for upload in &extracted.uploads {
+                        match std::fs::read(&upload.path) {
+                            Ok(data) => {
+                                let file = OutgoingAttachment {
+                                    filename: upload.filename.clone(),
+                                    data,
+                                    mime: crate::outbound::guess_mime(&upload.filename).to_string(),
+                                };
+                                if let Err(e) = adapter.send_file(&thread_channel, &file).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, filename = %upload.filename, "file upload failed");
+                                    if let Err(e2) = adapter
+                                        .send_message(
+                                            &thread_channel,
+                                            &format!("⚠️ Couldn't attach `{}` — upload failed", upload.filename),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(error = ?e2, platform = %thread_channel.platform, "attachment failure notice also failed");
+                                        delivery_failed = true;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, path = %upload.path.display(), "attachment read failed at delivery");
+                                if let Err(e2) = adapter
+                                    .send_message(
+                                        &thread_channel,
+                                        &format!("⚠️ Couldn't attach `{}` — file unreadable", upload.filename),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(error = ?e2, platform = %thread_channel.platform, "attachment failure notice also failed");
+                                    delivery_failed = true;
+                                }
+                            }
+                        }
+                    }
+                    if !extracted.notes.is_empty() {
+                        let note = format!("⚠️ {}", extracted.notes.join("\n⚠️ "));
+                        if let Err(e) = adapter.send_message(&thread_channel, &note).await {
+                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "attachment notes delivery failed");
+                            delivery_failed = true;
                         }
                     }
 

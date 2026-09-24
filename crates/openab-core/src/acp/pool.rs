@@ -393,6 +393,19 @@ impl SessionPool {
         false
     }
 
+    /// Effective working directory for a session: the stored per-session
+    /// override when present, else the global configured `working_dir`.
+    /// Used by outbound attachment resolution (`[[attach:…]]` / `![…](path)`)
+    /// to scope agent-referenced file paths to the workspace boundary.
+    pub async fn session_workdir(&self, thread_id: &str) -> String {
+        let state = self.state.read().await;
+        state
+            .session_workdirs
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_else(|| self.config.working_dir.clone())
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,

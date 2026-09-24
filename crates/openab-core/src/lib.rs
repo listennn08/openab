@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod markdown;
 pub mod media;
 pub mod multibot_cache;
+pub mod outbound;
 #[cfg(feature = "pre-seed")]
 pub mod pre_seed;
 #[cfg(feature = "filestore")]

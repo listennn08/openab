@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, OutgoingAttachment, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -468,6 +468,59 @@ impl ChatAdapter for SlackAdapter {
                 origin_event_id: None,
             },
             message_id: ts.to_string(),
+        })
+    }
+
+    /// Upload a file to the channel via the files.uploadV2 flow:
+    /// files.getUploadURLExternal → POST raw bytes → files.completeUploadExternal.
+    /// Requires the `files:write` OAuth scope on the bot token.
+    async fn send_file(&self, channel: &ChannelRef, file: &OutgoingAttachment) -> Result<MessageRef> {
+        // Step 1: mint an upload URL (form-encoded per Slack docs).
+        let length = file.data.len().to_string();
+        let resp = self
+            .client
+            .post(format!("{SLACK_API}/files.getUploadURLExternal"))
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .form(&[("filename", file.filename.as_str()), ("length", length.as_str())])
+            .send()
+            .await?;
+        let json: serde_json::Value = resp.json().await?;
+        if json["ok"].as_bool() != Some(true) {
+            let err = json["error"].as_str().unwrap_or("unknown error");
+            return Err(anyhow!("Slack API files.getUploadURLExternal: {err}"));
+        }
+        let upload_url = json["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no upload_url in files.getUploadURLExternal response"))?
+            .to_string();
+        let file_id = json["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no file_id in files.getUploadURLExternal response"))?
+            .to_string();
+
+        // Step 2: POST the raw file bytes to the upload URL.
+        self.client
+            .post(&upload_url)
+            .body(file.data.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+
+        // Step 3: complete the upload, sharing into the channel/thread.
+        let mut body = serde_json::json!({
+            "files": [{ "id": file_id, "title": file.filename }],
+            "channel_id": channel.channel_id,
+        });
+        if let Some(ts) = &channel.thread_id {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+        self.api_post("files.completeUploadExternal", body).await?;
+
+        // completeUploadExternal returns the file objects but no message ts —
+        // the file_id is the stable handle we can report back.
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: file_id,
         })
     }
 
